@@ -101,6 +101,9 @@ type PlatformService struct {
 	goroutineExitSignal chan struct{}
 	goroutineBuffered   chan struct{}
 
+	// Redis Cluster for high availability
+	redisCluster *RedisCluster
+
 	additionalClusterHandlers map[model.ClusterEvent]einterfaces.ClusterMessageHandler
 
 	shareChannelServiceMux sync.RWMutex
@@ -421,6 +424,79 @@ func (ps *PlatformService) Start(broadcastHooks map[string]BroadcastHook) error 
 		message.Add("license", ps.GetSanitizedClientLicense())
 		ps.Publish(message)
 	})
+
+	if ps.featureFlagSynchronizer != nil {
+		if err := ps.featureFlagSynchronizer.EnsureReady(); err != nil {
+			return err
+		}
+	}
+	
+	// Initialize Redis Cluster for High Availability if enabled
+	if ps.Config().RedisSettings.Enable && ps.Config().ServiceSettings.EnableRedisForClustering != nil && *ps.Config().ServiceSettings.EnableRedisForClustering {
+		ps.redisCluster = NewRedisCluster(ps)
+		if err := ps.redisCluster.Start(); err != nil {
+			ps.logger.Error("Failed to start Redis cluster", mlog.Err(err))
+			// Non-fatal error, continue startup
+		} else {
+			ps.logger.Info("Redis cluster started successfully", mlog.String("node_id", ps.redisCluster.GetNodeID()))
+		}
+	}
+
+	return nil
+}
+
+func (ps *PlatformService) Shutdown() error {
+	ps.logger.Info("Stopping Server...")
+
+	ps.SetStatus(model.StatusShutdown)
+
+	if ps.Busy != nil {
+		ps.Busy.StopBusySystem()
+	}
+
+	if ps.featureFlagStop != nil {
+		close(ps.featureFlagStop)
+		<-ps.featureFlagStopped
+	}
+
+	if ps.Store != nil {
+		ps.Store.Close()
+	}
+
+	// Stop Redis Cluster if initialized
+	if ps.redisCluster != nil {
+		ps.redisCluster.Stop()
+	}
+
+	if ps.searchLicenseListenerId != "" {
+		ps.RemoveLicenseListener(ps.searchLicenseListenerId)
+	}
+
+	if ps.searchConfigListenerId != "" {
+		ps.configStore.RemoveListener(ps.searchConfigListenerId)
+	}
+
+	ps.HubStop()
+
+	if ps.CacheProvider != nil {
+		if err := ps.CacheProvider.Close(); err != nil {
+			return err
+		}
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*15)
+	defer cancel()
+
+	if ps.goroutineExitSignal != nil {
+		close(ps.goroutineExitSignal)
+	}
+
+	if err := ps.scheduler.Stop(); err != nil {
+		ps.logger.Warn("Error stopping scheduler", mlog.Err(err))
+	}
+
+	ps.waitForGoroutines(timeoutCtx)
+
 	return nil
 }
 
@@ -491,30 +567,6 @@ func (ps *PlatformService) TotalWebsocketConnections() int {
 	}
 
 	return int(count)
-}
-
-func (ps *PlatformService) Shutdown() error {
-	ps.HubStop()
-
-	ps.RemoveLicenseListener(ps.licenseListenerId)
-
-	// we need to wait the goroutines to finish before closing the store
-	// and this needs to be called after hub stop because hub generates goroutines
-	// when it is active. If we wait first we have no mechanism to prevent adding
-	// more go routines hence they still going to be invoked.
-	ps.waitForGoroutines()
-
-	if ps.Store != nil {
-		ps.Store.Close()
-	}
-
-	if ps.cacheProvider != nil {
-		if err := ps.cacheProvider.Close(); err != nil {
-			return fmt.Errorf("unable to cleanly shutdown cache: %w", err)
-		}
-	}
-
-	return nil
 }
 
 func (ps *PlatformService) CacheProvider() cache.Provider {

@@ -176,8 +176,20 @@ func (ps *PlatformService) Publish(message *model.WebSocketEvent) {
 		ps.metricsIFace.IncrementWebsocketEvent(message.EventType())
 	}
 
-	ps.PublishSkipClusterSend(message)
-
+	// If we have a Redis cluster, use it to distribute the message
+	if ps.redisCluster != nil && ps.redisCluster.isActive {
+		// Add this to track the origin of the event
+		message.SetBroadcastData("origin_node_id", ps.redisCluster.GetNodeID())
+		
+		// First, publish locally to this server's connections
+		ps.PublishSkipClusterSend(message)
+		
+		// Then publish to Redis to distribute to other servers
+		ps.redisCluster.PublishWebSocketEvent(message)
+		return
+	}
+	
+	// Original cluster implementation as fallback
 	if ps.clusterIFace != nil {
 		data, err := message.ToJSON()
 		if err != nil {
@@ -200,6 +212,8 @@ func (ps *PlatformService) Publish(message *model.WebSocketEvent) {
 
 		ps.clusterIFace.SendClusterMessage(cm)
 	}
+
+	ps.PublishSkipClusterSend(message)
 }
 
 func (ps *PlatformService) PublishSkipClusterSend(event *model.WebSocketEvent) {

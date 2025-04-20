@@ -1,0 +1,644 @@
+diff --git a/server/public/model/config.go b/server/public/model/config.go
+index abcd1234..dcba5678 100644
+--- a/server/public/model/config.go
++++ b/server/public/model/config.go
+@@ -430,6 +430,9 @@ type ServiceSettings struct {
+ 	ScheduledPosts                                    *bool   `access:"site_posts"`
+ 	EnableWebHubChannelIteration                      *bool   `access:"write_restrictable,cloud_restrictable"`
+ 	FrameAncestors                                    *string `access:"write_restrictable,cloud_restrictable"`
++
++	// Added for high availability
++	EnableRedisForClustering                          *bool   `access:"environment_high_availability"`
+ }
+ 
+ func (s *ServiceSettings) SetDefaults(isUpdate bool) {
+@@ -733,6 +736,10 @@ func (s *ServiceSettings) SetDefaults(isUpdate bool) {
+ 	if s.FrameAncestors == nil {
+ 		s.FrameAncestors = NewPointer("")
+ 	}
++
++	if s.EnableRedisForClustering == nil {
++		s.EnableRedisForClustering = NewPointer(false)
++	}
+ }
+ 
+ type CacheSettings struct {
+@@ -3764,6 +3771,7 @@ type Config struct {
+ 	WranglerSettings            WranglerSettings
+ 	ConnectedWorkspacesSettings ConnectedWorkspacesSettings
+ 	AccessControlSettings       AccessControlSettings
++	RedisSettings               RedisSettings
+ }
+ 
+ // Auditable returns a map of the config fields to their values.
+@@ -3851,6 +3859,7 @@ func (cfg *Config) SetDefaults() {
+ 	cfg.WranglerSettings.SetDefaults()
+ 	cfg.ConnectedWorkspacesSettings.SetDefaults(cfg.isUpdate(), cfg.ExperimentalSettings)
+ 	cfg.AccessControlSettings.SetDefaults()
++	cfg.RedisSettings.SetDefaults()
+ }
+ 
+ func (cfg *Config) IsValid() *AppError {
+@@ -3982,6 +3991,10 @@ func (cfg *Config) IsValid() *AppError {
+ 		return err
+ 	}
+ 
++	if err := cfg.RedisSettings.IsValid(); err != nil {
++		return err
++	}
++	
+ 	return nil
+ }
+ 
+diff --git a/server/public/model/redis_settings.go b/server/public/model/redis_settings.go
+new file mode 100644
+index 0000000..7d92be5
+--- /dev/null
++++ b/server/public/model/redis_settings.go
+@@ -0,0 +1,64 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++package model
++
++import (
++	"net/http"
++)
++
++// RedisSettings stores the configuration for Redis connection
++type RedisSettings struct {
++	Enable               *bool   `access:"environment_high_availability,write_restrictable,cloud_restrictable"`
++	ClusterAddress       *string `access:"environment_high_availability,write_restrictable,cloud_restrictable"` // telemetry: none
++	Password             *string `access:"environment_high_availability,write_restrictable,cloud_restrictable"` // telemetry: none
++	Database             *int    `access:"environment_high_availability,write_restrictable,cloud_restrictable"` // telemetry: none
++	MaxIdleConns         *int    `access:"environment_high_availability,write_restrictable,cloud_restrictable"`
++	MaxActiveConns       *int    `access:"environment_high_availability,write_restrictable,cloud_restrictable"`
++	IdleTimeoutSecs      *int    `access:"environment_high_availability,write_restrictable,cloud_restrictable"`
++	ConnectTimeoutSecs   *int    `access:"environment_high_availability,write_restrictable,cloud_restrictable"`
++	ReadTimeoutSecs      *int    `access:"environment_high_availability,write_restrictable,cloud_restrictable"`
++	WriteTimeoutSecs     *int    `access:"environment_high_availability,write_restrictable,cloud_restrictable"`
++}
++
++// SetDefaults sets the default values for Redis settings
++func (s *RedisSettings) SetDefaults() {
++	if s.Enable == nil {
++		s.Enable = NewPointer(false)
++	}
++
++	if s.ClusterAddress == nil {
++		s.ClusterAddress = NewPointer("localhost:6379")
++	}
++
++	if s.Password == nil {
++		s.Password = NewPointer("")
++	}
++
++	if s.Database == nil {
++		s.Database = NewPointer(0)
++	}
++
++	if s.MaxIdleConns == nil {
++		s.MaxIdleConns = NewPointer(10)
++	}
++
++	if s.MaxActiveConns == nil {
++		s.MaxActiveConns = NewPointer(20)
++	}
++
++	if s.IdleTimeoutSecs == nil {
++		s.IdleTimeoutSecs = NewPointer(300)
++	}
++
++	if s.ConnectTimeoutSecs == nil {
++		s.ConnectTimeoutSecs = NewPointer(5)
++	}
++
++	if s.ReadTimeoutSecs == nil {
++		s.ReadTimeoutSecs = NewPointer(3)
++	}
++
++	if s.WriteTimeoutSecs == nil {
++		s.WriteTimeoutSecs = NewPointer(3)
++	}
++}
++
++// IsValid validates the Redis settings
++func (s *RedisSettings) IsValid() *AppError {
++	if *s.Enable && *s.ClusterAddress == "" {
++		return NewAppError("Config.IsValid", "model.config.is_valid.empty_redis_cluster_address.app_error", nil, "", http.StatusBadRequest)
++	}
++
++	if *s.Database < 0 {
++		return NewAppError("Config.IsValid", "model.config.is_valid.invalid_redis_db.app_error", nil, "", http.StatusBadRequest)
++	}
++
++	return nil
++}
++
+diff --git a/server/channels/app/platform/cluster.go b/server/channels/app/platform/cluster.go
+index abcd1234..dcba5678 100644
+--- a/server/channels/app/platform/cluster.go
++++ b/server/channels/app/platform/cluster.go
+@@ -172,23 +172,35 @@ func (ps *PlatformService) InvokeClusterLeaderChangedListeners() {
+ }
+ 
+ func (ps *PlatformService) Publish(message *model.WebSocketEvent) {
++	// Increment metrics regardless of the publishing method
+ 	if ps.metricsIFace != nil {
+ 		ps.metricsIFace.IncrementWebsocketEvent(message.EventType())
+ 	}
+ 
++	// If we have a Redis cluster, use it to distribute the message
++	if ps.redisCluster != nil && ps.redisCluster.isActive {
++		// Add this to track the origin of the event
++		message.SetBroadcastData("origin_node_id", ps.redisCluster.GetNodeID())
++		
++		// First, publish locally to this server's connections
++		ps.PublishSkipClusterSend(message)
++		
++		// Then publish to Redis to distribute to other servers
++		ps.redisCluster.PublishWebSocketEvent(message)
++		return
++	}
++	
++	// Original cluster implementation as fallback
++	if ps.clusterIFace != nil {
++		data, err := message.ToJSON()
++		if err != nil {
++			mlog.Warn("Failed to encode message to JSON", mlog.Err(err))
++		}
+ 
+-	ps.PublishSkipClusterSend(message)
+-
+-	if ps.clusterIFace != nil {
+-		data, err := message.ToJSON()
+-		if err != nil {
+-			mlog.Warn("Failed to encode message to JSON", mlog.Err(err))
+-		}
+ 		cm := &model.ClusterMessage{
+ 			Event:    model.ClusterEventPublish,
+ 			SendType: model.ClusterSendBestEffort,
+ 			Data:     data,
+ 		}
+ 
+ 		if message.EventType() == model.WebsocketEventPosted ||
+@@ -202,6 +214,9 @@ func (ps *PlatformService) Publish(message *model.WebSocketEvent) {
+ 
+ 		ps.clusterIFace.SendClusterMessage(cm)
+ 	}
++
++	// If no cluster or local only publish
++	ps.PublishSkipClusterSend(message)
+ }
+ 
+ func (ps *PlatformService) PublishSkipClusterSend(event *model.WebSocketEvent) {
+ 
+diff --git a/server/channels/app/platform/service.go b/server/channels/app/platform/service.go
+index abcd1234..dcba5678 100644
+--- a/server/channels/app/platform/service.go
++++ b/server/channels/app/platform/service.go
+@@ -101,6 +101,9 @@ type PlatformService struct {
+ 	goroutineExitSignal chan struct{}
+ 	goroutineBuffered   chan struct{}
+ 
++	// Redis Cluster for high availability
++	redisCluster *RedisCluster
++
+ 	additionalClusterHandlers map[model.ClusterEvent]einterfaces.ClusterMessageHandler
+ 
+ 	shareChannelServiceMux sync.RWMutex
+@@ -432,6 +435,18 @@ func (ps *PlatformService) Start(broadcastHooks map[string]BroadcastHook) error
+ 		}
+ 	})
+ 
++	if ps.featureFlagSynchronizer != nil {
++		if err := ps.featureFlagSynchronizer.EnsureReady(); err != nil {
++			return err
++		}
++	}
++	
++	// Initialize Redis Cluster for High Availability if enabled
++	if ps.Config().RedisSettings.Enable && ps.Config().ServiceSettings.EnableRedisForClustering != nil && *ps.Config().ServiceSettings.EnableRedisForClustering {
++		ps.redisCluster = NewRedisCluster(ps)
++		if err := ps.redisCluster.Start(); err != nil {
++			ps.logger.Error("Failed to start Redis cluster", mlog.Err(err))
++			// Non-fatal error, continue startup
++		} else {
++			ps.logger.Info("Redis cluster started successfully", mlog.String("node_id", ps.redisCluster.GetNodeID()))
++		}
++	}
++
+ 	return nil
+ }
+ 
+@@ -495,6 +510,11 @@ func (ps *PlatformService) Shutdown() error {
+ 		close(ps.featureFlagStop)
+ 		<-ps.featureFlagStopped
+ 	}
++	
++	// Stop Redis Cluster if initialized
++	if ps.redisCluster != nil {
++		ps.redisCluster.Stop()
++	}
+ 
+ 	// we need to wait the goroutines to finish before closing the store
+ 	// and this needs to be called after hub stop because hub generates goroutines
+diff --git a/server/channels/app/platform/redis_cluster.go b/server/channels/app/platform/redis_cluster.go
+new file mode 100644
+index 0000000..c1d4fd0
+--- /dev/null
++++ b/server/channels/app/platform/redis_cluster.go
+@@ -0,0 +1,353 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++package platform
++
++import (
++	"encoding/json"
++	"sync"
++	"time"
++
++	"github.com/mattermost/mattermost/server/public/model"
++	"github.com/mattermost/mattermost/server/public/shared/mlog"
++	"github.com/redis/go-redis/v9"
++	"golang.org/x/net/context"
++)
++
++const (
++	RedisChannelWebSocketEvents = "mattermost:cluster:websocket_events"
++	RedisChannelUserPresence    = "mattermost:cluster:user_presence"
++	RedisChannelTypingEvents    = "mattermost:cluster:typing_events"
++	RedisKeyClusterNodes        = "mattermost:cluster:nodes"
++	RedisKeepAliveInterval      = 30 * time.Second
++)
++
++// RedisCluster manages Redis-based cluster communication
++type RedisCluster struct {
++	ps              *PlatformService
++	client          *redis.Client
++	pubsub          *redis.PubSub
++	ctx             context.Context
++	cancel          context.CancelFunc
++	nodeID          string
++	isActive        bool
++	lock            sync.RWMutex
++	redisEventsChan <-chan *redis.Message
++}
++
++// NewRedisCluster creates a new RedisCluster
++func NewRedisCluster(ps *PlatformService) *RedisCluster {
++	ctx, cancel := context.WithCancel(context.Background())
++	
++	return &RedisCluster{
++		ps:        ps,
++		ctx:       ctx,
++		cancel:    cancel,
++		nodeID:    model.NewId(),
++		isActive:  false,
++	}
++}
++
++// Start initializes Redis connections and subscriptions
++func (rc *RedisCluster) Start() error {
++	rc.lock.Lock()
++	defer rc.lock.Unlock()
++	
++	if rc.isActive {
++		return nil
++	}
++	
++	// Initialize Redis client
++	rc.client = redis.NewClient(&redis.Options{
++		Addr:     rc.ps.Config().RedisSettings.ClusterAddress,
++		Password: rc.ps.Config().RedisSettings.Password,
++		DB:       rc.ps.Config().RedisSettings.Database,
++	})
++	
++	// Test connection
++	if _, err := rc.client.Ping(rc.ctx).Result(); err != nil {
++		mlog.Error("Failed to connect to Redis for clustering", mlog.Err(err))
++		return err
++	}
++	
++	// Subscribe to cluster channels
++	rc.pubsub = rc.client.Subscribe(rc.ctx,
++		RedisChannelWebSocketEvents,
++		RedisChannelUserPresence,
++		RedisChannelTypingEvents,
++	)
++	
++	rc.redisEventsChan = rc.pubsub.Channel()
++	
++	// Register node in cluster
++	nodeInfo := map[string]interface{}{
++		"id":        rc.nodeID,
++		"timestamp": time.Now().UnixNano(),
++	}
++	
++	nodeInfoJSON, _ := json.Marshal(nodeInfo)
++	rc.client.HSet(rc.ctx, RedisKeyClusterNodes, rc.nodeID, nodeInfoJSON)
++	
++	// Set expiration for node entry
++	rc.client.Expire(rc.ctx, RedisKeyClusterNodes, 2*RedisKeepAliveInterval)
++	
++	// Start processing Redis events
++	go rc.processRedisEvents()
++	
++	// Start keep-alive routine
++	go rc.keepAlive()
++	
++	rc.isActive = true
++	
++	mlog.Info("Redis cluster initialized", mlog.String("node_id", rc.nodeID))
++	
++	return nil
++}
++
++// Stop terminates Redis connections and subscriptions
++func (rc *RedisCluster) Stop() {
++	rc.lock.Lock()
++	defer rc.lock.Unlock()
++	
++	if !rc.isActive {
++		return
++	}
++	
++	// Cancel context to stop all goroutines
++	rc.cancel()
++	
++	// Remove this node from cluster
++	rc.client.HDel(context.Background(), RedisKeyClusterNodes, rc.nodeID)
++	
++	// Close connections
++	if rc.pubsub != nil {
++		rc.pubsub.Close()
++	}
++	
++	if rc.client != nil {
++		rc.client.Close()
++	}
++	
++	rc.isActive = false
++	
++	mlog.Info("Redis cluster connections closed", mlog.String("node_id", rc.nodeID))
++}
++
++// GetNodeID returns this node's unique ID
++func (rc *RedisCluster) GetNodeID() string {
++	return rc.nodeID
++}
++
++// PublishWebSocketEvent publishes a WebSocket event to all cluster nodes
++func (rc *RedisCluster) PublishWebSocketEvent(event *model.WebSocketEvent) {
++	rc.lock.RLock()
++	defer rc.lock.RUnlock()
++	
++	if !rc.isActive {
++		return
++	}
++	
++	// Add origin node ID to the event
++	event.SetBroadcastData("origin_node_id", rc.nodeID)
++	
++	// Serialize the event
++	jsonEvent, err := json.Marshal(event)
++	if err != nil {
++		mlog.Error("Failed to serialize WebSocket event", mlog.Err(err))
++		return
++	}
++	
++	// Publish to Redis
++	if err := rc.client.Publish(rc.ctx, RedisChannelWebSocketEvents, jsonEvent).Err(); err != nil {
++		mlog.Error("Failed to publish WebSocket event to Redis", mlog.Err(err))
++	}
++}
++
++// PublishUserPresence publishes a user presence update to all cluster nodes
++func (rc *RedisCluster) PublishUserPresence(userID string, status string, manual bool, activityAt int64) {
++	rc.lock.RLock()
++	defer rc.lock.RUnlock()
++	
++	if !rc.isActive {
++		return
++	}
++	
++	presenceEvent := map[string]interface{}{
++		"user_id":      userID,
++		"status":       status,
++		"manual":       manual,
++		"activity_at":  activityAt,
++		"node_id":      rc.nodeID,
++	}
++	
++	// Serialize the event
++	jsonEvent, err := json.Marshal(presenceEvent)
++	if err != nil {
++		mlog.Error("Failed to serialize presence event", mlog.Err(err))
++		return
++	}
++	
++	// Publish to Redis
++	if err := rc.client.Publish(rc.ctx, RedisChannelUserPresence, jsonEvent).Err(); err != nil {
++		mlog.Error("Failed to publish presence event to Redis", mlog.Err(err))
++	}
++}
++
++// PublishTypingEvent publishes typing status to all cluster nodes
++func (rc *RedisCluster) PublishTypingEvent(userID, channelID, parentID string) {
++	rc.lock.RLock()
++	defer rc.lock.RUnlock()
++	
++	if !rc.isActive {
++		return
++	}
++	
++	typingEvent := map[string]interface{}{
++		"user_id":     userID,
++		"channel_id":  channelID,
++		"parent_id":   parentID,
++		"node_id":     rc.nodeID,
++	}
++	
++	// Serialize the event
++	jsonEvent, err := json.Marshal(typingEvent)
++	if err != nil {
++		mlog.Error("Failed to serialize typing event", mlog.Err(err))
++		return
++	}
++	
++	// Publish to Redis
++	if err := rc.client.Publish(rc.ctx, RedisChannelTypingEvents, jsonEvent).Err(); err != nil {
++		mlog.Error("Failed to publish typing event to Redis", mlog.Err(err))
++	}
++}
++
++// processRedisEvents handles messages from Redis subscriptions
++func (rc *RedisCluster) processRedisEvents() {
++	for {
++		select {
++		case <-rc.ctx.Done():
++			return
++			
++		case msg, ok := <-rc.redisEventsChan:
++			if !ok {
++				mlog.Error("Redis subscription channel closed")
++				return
++			}
++			
++			switch msg.Channel {
++			case RedisChannelWebSocketEvents:
++				rc.handleWebSocketEvent(msg.Payload)
++				
++			case RedisChannelUserPresence:
++				rc.handlePresenceEvent(msg.Payload)
++				
++			case RedisChannelTypingEvents:
++				rc.handleTypingEvent(msg.Payload)
++			}
++		}
++	}
++}
++
++// handleWebSocketEvent processes WebSocket events from other nodes
++func (rc *RedisCluster) handleWebSocketEvent(payload string) {
++	var event model.WebSocketEvent
++	if err := json.Unmarshal([]byte(payload), &event); err != nil {
++		mlog.Error("Failed to unmarshal WebSocket event", mlog.Err(err))
++		return
++	}
++	
++	// Skip if this event originated from this node
++	if originNodeID, ok := event.GetBroadcastData()["origin_node_id"].(string); ok && originNodeID == rc.nodeID {
++		return
++	}
++	
++	// Remove the origin node ID to prevent loops if this event gets republished
++	event.RemoveBroadcastData("origin_node_id")
++	
++	// Forward to local WebSocket hub without republishing to Redis
++	rc.ps.PublishSkipClusterSend(&event)
++}
++
++// handlePresenceEvent processes presence events from other nodes
++func (rc *RedisCluster) handlePresenceEvent(payload string) {
++	var presenceEvent map[string]interface{}
++	if err := json.Unmarshal([]byte(payload), &presenceEvent); err != nil {
++		mlog.Error("Failed to unmarshal presence event", mlog.Err(err))
++		return
++	}
++	
++	// Skip if this event originated from this node
++	if nodeID, ok := presenceEvent["node_id"].(string); ok && nodeID == rc.nodeID {
++		return
++	}
++	
++	// Extract event data
++	userID, _ := presenceEvent["user_id"].(string)
++	status, _ := presenceEvent["status"].(string)
++	activityAtFloat, _ := presenceEvent["activity_at"].(float64)
++	activityAt := int64(activityAtFloat)
++	manual, _ := presenceEvent["manual"].(bool)
++	
++	// Update local status cache
++	if userID != "" && status != "" {
++		rc.ps.AddStatusCache(&model.Status{
++			UserId:         userID,
++			Status:         status,
++			Manual:         manual,
++			LastActivityAt: activityAt,
++		})
++		
++		// Broadcast to local WebSocket connections
++		statusEvent := model.NewWebSocketEvent(model.WebsocketEventStatusChange, "", "", "", nil, "")
++		statusEvent.Add("user_id", userID)
++		statusEvent.Add("status", status)
++		rc.ps.PublishSkipClusterSend(statusEvent)
++	}
++}
++
++// handleTypingEvent processes typing events from other nodes
++func (rc *RedisCluster) handleTypingEvent(payload string) {
++	var typingEvent map[string]interface{}
++	if err := json.Unmarshal([]byte(payload), &typingEvent); err != nil {
++		mlog.Error("Failed to unmarshal typing event", mlog.Err(err))
++		return
++	}
++	
++	// Skip if this event originated from this node
++	if nodeID, ok := typingEvent["node_id"].(string); ok && nodeID == rc.nodeID {
++		return
++	}
++	
++	// Extract event data
++	userID, _ := typingEvent["user_id"].(string)
++	channelID, _ := typingEvent["channel_id"].(string)
++	parentID, _ := typingEvent["parent_id"].(string)
++	
++	// Create typing WebSocket event
++	typingWSEvent := model.NewWebSocketEvent(model.WebsocketEventTyping, channelID, "", userID, nil, "")
++	if parentID != "" {
++		typingWSEvent.Add("parent_id", parentID)
++	}
++	
++	// Broadcast to local WebSocket connections
++	rc.ps.PublishSkipClusterSend(typingWSEvent)
++}
++
++// keepAlive periodically updates this node's entry in Redis
++func (rc *RedisCluster) keepAlive() {
++	ticker := time.NewTicker(RedisKeepAliveInterval)
++	defer ticker.Stop()
++	
++	for {
++		select {
++		case <-rc.ctx.Done():
++			return
++			
++		case <-ticker.C:
++			rc.lock.RLock()
++			if !rc.isActive {
++				rc.lock.RUnlock()
++				return
++			}
++			
++			// Update node timestamp
++			nodeInfo := map[string]interface{}{
++				"id":        rc.nodeID,
++				"timestamp": time.Now().UnixNano(),
++			}
++			
++			nodeInfoJSON, _ := json.Marshal(nodeInfo)
++			err := rc.client.HSet(rc.ctx, RedisKeyClusterNodes, rc.nodeID, nodeInfoJSON).Err()
++			
++			// Refresh expiration
++			rc.client.Expire(rc.ctx, RedisKeyClusterNodes, 2*RedisKeepAliveInterval)
++			
++			rc.lock.RUnlock()
++			
++			if err != nil {
++				mlog.Error("Failed to update node keepalive", mlog.Err(err))
++			}
++		}
++	}
++}
++
++// GetClusterNodes returns a list of active nodes in the cluster
++func (rc *RedisCluster) GetClusterNodes() []string {
++	if !rc.isActive {
++		return []string{rc.nodeID}
++	}
++	
++	nodes, err := rc.client.HGetAll(rc.ctx, RedisKeyClusterNodes).Result()
++	if err != nil {
++		mlog.Error("Failed to get cluster nodes", mlog.Err(err))
++		return []string{rc.nodeID}
++	}
++	
++	nodeIDs := make([]string, 0, len(nodes))
++	for id := range nodes {
++		nodeIDs = append(nodeIDs, id)
++	}
++	
++	return nodeIDs
++}
