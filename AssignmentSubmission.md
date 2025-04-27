@@ -15,6 +15,7 @@ My task was to address three main requirements:
 Before jumping into coding, I spent some time understanding how Mattermost currently works.
 
 **Current Single-Server Architecture:**
+![Uploading Screenshot 2025-04-20 at 7.42.57 PM.png…]()
 
 * Client Browser/App connects to Load Balancer
 * Load Balancer directs traffic to a Single Mattermost Server
@@ -117,7 +118,7 @@ After testing different approaches, I went with the hybrid solution for these re
 5. **Reliability**: Provides backup options and fault tolerance
 
 ## Architecture Design
-
+<img width="1216" alt="Screenshot 2025-04-20 at 7 41 41 PM" src="https://github.com/user-attachments/assets/8001c97f-8e3a-4bb5-823c-1e2ca846023c" />
 
 
 **New High-Availability Multi-Server Architecture:**
