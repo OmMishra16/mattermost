@@ -15,7 +15,8 @@ My task was to address three main requirements:
 Before jumping into coding, I spent some time understanding how Mattermost currently works.
 
 **Current Single-Server Architecture:**
-![Uploading Screenshot 2025-04-20 at 7.42.57 PM.png…]()
+<img width="321" alt="Screenshot 2025-04-20 at 7 43 43 PM" src="https://github.com/user-attachments/assets/120b58ec-bd69-4e44-9a59-c252d9912178" />
+
 
 * Client Browser/App connects to Load Balancer
 * Load Balancer directs traffic to a Single Mattermost Server
